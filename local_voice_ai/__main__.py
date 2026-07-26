@@ -18,22 +18,15 @@ import sys
 from pathlib import Path
 
 import uvicorn
+from dotenv import load_dotenv
 
 from .api import build_app
 from .config import Config
-from .supervisor import ChildSpec, Supervisor, configure_logging
+from .settings_manager import SettingsManager
+from .specs import build_specs
+from .supervisor import Supervisor, configure_logging
 
 logger = logging.getLogger("main")
-
-
-def _llama_cache_dir(env: dict[str, str]) -> Path:
-    """The legacy llama.cpp download cache, mirroring its
-    fs_get_cache_directory() precedence given the env we pass the child."""
-    if env.get("LLAMA_CACHE"):
-        return Path(env["LLAMA_CACHE"])
-    if env.get("XDG_CACHE_HOME"):
-        return Path(env["XDG_CACHE_HOME"]) / "llama.cpp"
-    return Path.home() / ".cache" / "llama.cpp"
 
 
 def _hf_hub_dir(env: dict[str, str]) -> Path:
@@ -43,38 +36,6 @@ def _hf_hub_dir(env: dict[str, str]) -> Path:
     if env.get("XDG_CACHE_HOME"):
         return Path(env["XDG_CACHE_HOME"]) / "huggingface" / "hub"
     return Path.home() / ".cache" / "huggingface" / "hub"
-
-
-def _llama_repo_cached(repo: str, env: dict[str, str]) -> bool:
-    """Best-effort check for whether a --hf-repo model is already downloaded, so
-    we can start --offline automatically after the first successful run.
-
-    Checks both cache layouts llama-server has used:
-      - HF hub (current): ``hub/models--<org>--<repo>/snapshots/*/<file>.gguf``
-      - legacy: ``llama.cpp/manifest=<org>=<repo>=<tag>.json`` + flat ggufs
-
-    Intentionally conservative: a false miss just means we don't add --offline
-    (unchanged network path), while we only claim "cached" for this exact
-    repo/quant so a newly-changed repo still downloads.
-    """
-    spec, tag = [*repo.rsplit(":", 1), "latest"][:2]
-
-    # HF hub layout. A :quant tag selects a file whose name contains the tag.
-    hub_repo = _hf_hub_dir(env) / f"models--{spec.replace('/', '--')}"
-    if hub_repo.is_dir():
-        pattern = f"*{tag}*.gguf" if tag != "latest" else "*.gguf"
-        if any(hub_repo.glob(f"snapshots/*/{pattern}")):
-            return True
-
-    # Legacy layout.
-    cache = _llama_cache_dir(env)
-    if not cache.is_dir():
-        return False
-    manifest = cache / f"manifest={spec.replace('/', '=')}={tag}.json"
-    if manifest.is_file():
-        return True
-    prefix = spec.replace("/", "_")
-    return any(p.suffix == ".gguf" for p in cache.glob(f"{prefix}*.gguf"))
 
 
 def _dir_size(path: Path) -> int:
@@ -137,154 +98,8 @@ def _startup_line(children: list[dict[str, object]]) -> str:
     return " | ".join(parts)
 
 
-def _build_specs(cfg: Config) -> list[ChildSpec]:
-    specs: list[ChildSpec] = []
-    py = sys.executable
-
-    # --- LiveKit server (Go binary) ----------------------------------
-    if cfg.manage_livekit:
-        livekit_bin = os.getenv("LIVEKIT_BIN", "livekit-server")
-        specs.append(
-            ChildSpec(
-                name="livekit",
-                argv=[
-                    livekit_bin,
-                    "--dev",
-                    "--bind", "0.0.0.0",
-                    "--port", str(cfg.livekit_bind_port),
-                    # livekit-server's RTC TCP port flag is the dotted config
-                    # key --rtc.tcp_port (there is no --rtc-port flag).
-                    "--rtc.tcp_port", str(cfg.livekit_rtc_port),
-                    # Pin the WebRTC UDP media port so it matches the published
-                    # container port, and advertise a host-reachable ICE address.
-                    # Without --node-ip the dev server auto-detects the container
-                    # IP (e.g. 172.x.x.x), which a browser on the host cannot
-                    # reach, so media never connects and the room never joins.
-                    "--udp-port", str(cfg.livekit_udp_port),
-                    "--node-ip", cfg.livekit_node_ip,
-                ],
-                ready_url=None,  # LiveKit dev server has no consistent /health
-                ready_timeout=30.0,
-            )
-        )
-
-    # --- llama.cpp server (C++ binary) -------------------------------
-    if cfg.manage_llama:
-        llama_bin = os.getenv("LLAMA_BIN", "llama-server")
-        llama_env = {
-            "HF_HOME": os.getenv("HF_HOME", "/models"),
-            "XDG_CACHE_HOME": os.getenv("XDG_CACHE_HOME", "/models"),
-        }
-        # A local .gguf path loads directly (no Hugging Face lookup); otherwise
-        # resolve from the HF repo. --offline forces cache-only startup so a
-        # previously-downloaded model runs with no network. (issue #9)
-        if cfg.llama_model_path:
-            model_argv = ["-m", cfg.llama_model_path]
-        else:
-            model_argv = ["--hf-repo", cfg.llama_hf_repo]
-        # LLAMA_OFFLINE, when set, wins; otherwise auto-enable --offline once the
-        # model is cached so restarts work with no internet, while the first run
-        # is still free to download.
-        if cfg.llama_offline is not None:
-            offline = cfg.llama_offline
-        elif cfg.llama_model_path:
-            offline = False  # -m needs no network regardless
-        else:
-            offline = _llama_repo_cached(cfg.llama_hf_repo, llama_env)
-            if offline:
-                logger.info("llama: %s found in cache; starting --offline", cfg.llama_hf_repo)
-        specs.append(
-            ChildSpec(
-                name="llama",
-                argv=[
-                    llama_bin,
-                    "--host", "127.0.0.1",
-                    "--port", str(cfg.llama_bind_port),
-                    *model_argv,
-                    *(["--offline"] if offline else []),
-                    "--alias", cfg.llama_model_alias,
-                    "--ctx-size", str(cfg.llama_ctx_size),
-                    "--n-gpu-layers", str(cfg.llama_n_gpu_layers),
-                    # Voice agent: thinking models (e.g. gemma-4) must answer
-                    # directly — reasoning tokens are seconds of dead air
-                    # before TTS gets any text.
-                    "--reasoning", "off",
-                ],
-                env=llama_env,
-                ready_url=f"http://127.0.0.1:{cfg.llama_bind_port}/v1/models",
-                ready_timeout=900.0,  # first-run model download can be slow
-            )
-        )
-
-    # --- STT (Nemotron or Whisper) -----------------------------------
-    if cfg.manage_stt:
-        if cfg.stt_provider == "whisper":
-            specs.append(
-                ChildSpec(
-                    name="whisper",
-                    argv=[
-                        py, "-m", "local_voice_ai.services.whisper.server",
-                        "--host", "127.0.0.1",
-                        "--port", str(cfg.stt_bind_port),
-                    ],
-                    env={
-                        "WHISPER_MODEL": cfg.whisper_model,
-                        "DEVICE": cfg.device,
-                    },
-                    ready_url=f"http://127.0.0.1:{cfg.stt_bind_port}/health",
-                    ready_timeout=600.0,
-                )
-            )
-        else:
-            specs.append(
-                ChildSpec(
-                    name="nemotron",
-                    argv=[
-                        py, "-m", "local_voice_ai.services.nemotron.server",
-                        "--host", "127.0.0.1",
-                        "--port", str(cfg.stt_bind_port),
-                    ],
-                    env={
-                        "NEMOTRON_MODEL_NAME": cfg.nemotron_model_name,
-                        "NEMOTRON_MODEL_ID": cfg.nemotron_model_id,
-                        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-                    },
-                    ready_url=f"http://127.0.0.1:{cfg.stt_bind_port}/health",
-                    ready_timeout=600.0,
-                )
-            )
-
-    # --- TTS (Kokoro) ------------------------------------------------
-    if cfg.manage_tts:
-        specs.append(
-            ChildSpec(
-                name="kokoro",
-                argv=[
-                    py, "-m", "local_voice_ai.services.kokoro.server",
-                    "--host", "127.0.0.1",
-                    "--port", str(cfg.tts_bind_port),
-                ],
-                ready_url=f"http://127.0.0.1:{cfg.tts_bind_port}/v1/models",
-                ready_timeout=600.0,
-            )
-        )
-
-    # --- Agent worker ------------------------------------------------
-    specs.append(
-        ChildSpec(
-            name="agent",
-            argv=[py, "-m", "local_voice_ai.agent", "start"],
-            env=cfg.agent_env(),
-            ready_url=None,
-            ready_timeout=30.0,
-        )
-    )
-
-    return specs
-
-
 async def _serve(cfg: Config) -> int:
-    specs = _build_specs(cfg)
+    specs = build_specs(cfg)
     supervisor = Supervisor(specs)
 
     logger.info(
@@ -294,7 +109,12 @@ async def _serve(cfg: Config) -> int:
     )
 
     status_provider = make_status_provider(supervisor, cfg)
-    app = build_app(cfg, status_provider=status_provider)
+    settings_manager = SettingsManager(cfg=cfg, supervisor=supervisor)
+    app = build_app(
+        cfg,
+        status_provider=status_provider,
+        settings_manager=settings_manager,
+    )
     uv_config = uvicorn.Config(
         app,
         host=cfg.web_host,
@@ -404,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("console", help="run the agent in interactive console mode")
 
     args = parser.parse_args(argv)
+    load_dotenv()
+    load_dotenv(".env.local")
     cfg = Config.from_env()
     configure_logging(cfg.log_level)
 

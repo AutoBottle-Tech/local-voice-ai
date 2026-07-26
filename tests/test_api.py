@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 
 from local_voice_ai.api import build_app
 from local_voice_ai.config import Config
+from local_voice_ai.settings_manager import SettingsManager
+from local_voice_ai.supervisor import Supervisor
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -31,6 +33,46 @@ def cfg(monkeypatch: pytest.MonkeyPatch) -> Config:
 @pytest.fixture
 def client(cfg: Config) -> TestClient:
     return TestClient(build_app(cfg))
+
+
+class TestConfigApi:
+    def test_get_config_returns_public_settings(self, client: TestClient) -> None:
+        r = client.get("/api/config")
+        assert r.status_code == 200
+        data = r.json()
+        assert "llm_provider" in data
+        assert "tts_provider" in data
+        assert "options" in data
+        assert "minimax_api_key" not in data
+
+    def test_put_settings_without_manager_returns_501(self, client: TestClient) -> None:
+        r = client.put("/api/settings", json={"llm_provider": "llama"})
+        assert r.status_code == 501
+
+    def test_put_settings_validates_provider(self, cfg: Config) -> None:
+        manager = SettingsManager(cfg=cfg, supervisor=Supervisor([]))
+
+        async def apply_patch() -> None:
+            with pytest.raises(ValueError, match="invalid llm_provider"):
+                await manager.apply({"llm_provider": "invalid"})
+
+        import asyncio
+
+        asyncio.run(apply_patch())
+
+    def test_put_settings_with_manager(self, cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+        supervisor = Supervisor([])
+
+        async def fake_reconfigure(_new_specs: list) -> None:
+            return None
+
+        monkeypatch.setattr(supervisor, "reconfigure", fake_reconfigure)
+        manager = SettingsManager(cfg=cfg, supervisor=supervisor)
+        client = TestClient(build_app(cfg, settings_manager=manager))
+        r = client.put("/api/settings", json={"wake_word": True})
+        assert r.status_code == 200
+        assert r.json() == {"restarting": True}
+        assert manager.cfg.wake_word is True
 
 
 class TestHealth:

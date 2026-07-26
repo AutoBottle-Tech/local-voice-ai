@@ -28,6 +28,9 @@ class ChildSpec:
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
     ready_url: str | None = None
+    # When set, readiness waits for this substring on stdout/stderr (e.g. LiveKit
+    # agent worker registration) instead of marking ready immediately.
+    ready_log_substring: str | None = None
     ready_timeout: float = 180.0
     max_restarts: int = 5
 
@@ -38,6 +41,7 @@ class _Child:
     process: asyncio.subprocess.Process | None = None
     restart_count: int = 0
     ready: bool = False
+    ready_log_event: asyncio.Event = field(default_factory=asyncio.Event)
     pump_task: asyncio.Task | None = None
     watch_task: asyncio.Task | None = None
 
@@ -93,6 +97,45 @@ class Supervisor:
         await self.shutdown()
         return 0
 
+    async def reconfigure(self, new_specs: list[ChildSpec]) -> None:
+        """Stop changed/removed children and start new/changed ones."""
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(2.0))
+
+        new_by_name = {spec.name: spec for spec in new_specs}
+        old_by_name = {child.spec.name: child for child in self._children}
+
+        for name, child in list(old_by_name.items()):
+            new_spec = new_by_name.get(name)
+            if new_spec is None or _spec_changed(child.spec, new_spec):
+                await self._terminate_one(child)
+
+        rebuilt: list[_Child] = []
+        for spec in new_specs:
+            existing = old_by_name.get(spec.name)
+            if (
+                existing is not None
+                and not _spec_changed(existing.spec, spec)
+                and existing.process is not None
+                and existing.process.returncode is None
+            ):
+                rebuilt.append(existing)
+            else:
+                rebuilt.append(_Child(spec=spec))
+
+        self._children = rebuilt
+
+        to_start = [
+            child
+            for child in self._children
+            if child.process is None or child.process.returncode is not None
+        ]
+        if not to_start:
+            return
+
+        await asyncio.gather(*(self._start(child) for child in to_start))
+        await asyncio.gather(*(self._await_ready(child) for child in to_start))
+
     async def shutdown(self, timeout: float = 10.0) -> None:
         """Terminate all children. SIGTERM, wait, SIGKILL if needed."""
         self._stop_event.set()
@@ -131,7 +174,34 @@ class Supervisor:
 
     # ---------------- internals ----------------
 
+    async def _terminate_one(self, child: _Child, timeout: float = 10.0) -> None:
+        for task in (child.pump_task, child.watch_task):
+            if task and not task.done():
+                task.cancel()
+        child.pump_task = None
+        child.watch_task = None
+
+        if child.process and child.process.returncode is None:
+            logger.info("[%s] terminating for reconfigure", child.spec.name)
+            try:
+                child.process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(child.process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                try:
+                    child.process.kill()
+                except ProcessLookupError:
+                    pass
+                await child.process.wait()
+
+        child.process = None
+        child.ready = False
+        child.ready_log_event = asyncio.Event()
+
     async def _start(self, child: _Child) -> None:
+        child.ready_log_event = asyncio.Event()
         env = {**os.environ, **child.spec.env}
         logger.info("[%s] starting: %s", child.spec.name, " ".join(child.spec.argv))
         child.process = await asyncio.create_subprocess_exec(
@@ -154,6 +224,8 @@ class Supervisor:
         assert child.process is not None
         prefix = f"[{child.spec.name}]"
 
+        ready_marker = child.spec.ready_log_substring
+
         async def pump(stream: asyncio.StreamReader | None, level: int) -> None:
             if stream is None:
                 return
@@ -161,7 +233,10 @@ class Supervisor:
                 line = await stream.readline()
                 if not line:
                     return
-                logger.log(level, "%s %s", prefix, line.decode(errors="replace").rstrip())
+                text = line.decode(errors="replace").rstrip()
+                logger.log(level, "%s %s", prefix, text)
+                if ready_marker and ready_marker in text and not child.ready_log_event.is_set():
+                    child.ready_log_event.set()
 
         await asyncio.gather(
             pump(child.process.stdout, logging.INFO),
@@ -169,11 +244,11 @@ class Supervisor:
         )
 
     async def _await_ready(self, child: _Child) -> None:
-        if child.spec.ready_url is None:
+        if child.spec.ready_url is None and child.spec.ready_log_substring is None:
             child.ready = True
             return
 
-        assert self._http is not None
+        assert self._http is not None or child.spec.ready_url is None
         deadline = asyncio.get_running_loop().time() + child.spec.ready_timeout
         delay = 0.5
 
@@ -184,17 +259,29 @@ class Supervisor:
                 raise RuntimeError(
                     f"{child.spec.name}: exited (rc={child.process.returncode}) before ready"
                 )
-            try:
-                resp = await self._http.get(child.spec.ready_url)
-                if resp.status_code < 400:
-                    child.ready = True
-                    logger.info("[%s] ready", child.spec.name)
-                    return
-            except (httpx.RequestError, httpx.HTTPError):
-                pass
+
+            if child.spec.ready_log_substring and child.ready_log_event.is_set():
+                child.ready = True
+                logger.info("[%s] ready (log marker %r)", child.spec.name, child.spec.ready_log_substring)
+                return
+
+            if child.spec.ready_url is not None:
+                try:
+                    resp = await self._http.get(child.spec.ready_url)
+                    if resp.status_code < 400:
+                        child.ready = True
+                        logger.info("[%s] ready", child.spec.name)
+                        return
+                except (httpx.RequestError, httpx.HTTPError):
+                    pass
 
             now = asyncio.get_running_loop().time()
             if now >= deadline:
+                if child.spec.ready_log_substring:
+                    raise TimeoutError(
+                        f"{child.spec.name}: log marker {child.spec.ready_log_substring!r} did not "
+                        f"appear within {child.spec.ready_timeout:.0f}s"
+                    )
                 raise TimeoutError(
                     f"{child.spec.name}: readiness probe {child.spec.ready_url} did not "
                     f"succeed within {child.spec.ready_timeout:.0f}s"
@@ -233,6 +320,16 @@ class Supervisor:
         except Exception as exc:
             logger.error("[%s] failed to recover: %s", child.spec.name, exc)
             self._stop_event.set()
+
+
+def _spec_changed(old: ChildSpec, new: ChildSpec) -> bool:
+    return (
+        old.argv != new.argv
+        or old.env != new.env
+        or old.cwd != new.cwd
+        or old.ready_url != new.ready_url
+        or old.ready_log_substring != new.ready_log_substring
+    )
 
 
 def configure_logging(level: str = "INFO") -> None:

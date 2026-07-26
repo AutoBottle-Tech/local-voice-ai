@@ -124,6 +124,25 @@ class TestReadinessTimeout:
             await sup.start_all()
         await sup.shutdown(timeout=1.0)
 
+    @pytest.mark.asyncio
+    async def test_log_marker_becomes_ready(self) -> None:
+        spec = ChildSpec(
+            name="logger",
+            argv=[
+                sys.executable,
+                "-c",
+                "import sys, time; time.sleep(0.2); print('registered worker', flush=True); time.sleep(60)",
+            ],
+            ready_log_substring="registered worker",
+            ready_timeout=5.0,
+        )
+        sup = Supervisor([spec])
+        try:
+            await sup.start_all()
+            assert sup.status()[0]["ready"] is True
+        finally:
+            await sup.shutdown(timeout=3.0)
+
 
 class TestCrashRecovery:
     @pytest.mark.asyncio

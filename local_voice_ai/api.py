@@ -13,7 +13,7 @@ import logging
 import random
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -21,6 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from livekit import api as lk_api
 
 from .config import Config
+
+if TYPE_CHECKING:
+    from .settings_manager import SettingsManager
 
 logger = logging.getLogger("api")
 
@@ -62,8 +65,14 @@ def _mint_token(cfg: Config, agent_name: str | None) -> dict[str, Any]:
 def build_app(
     cfg: Config,
     status_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    settings_manager: "SettingsManager | None" = None,
 ) -> FastAPI:
     app = FastAPI(title="local-voice-ai", version="0.1.0")
+
+    def current_cfg() -> Config:
+        if settings_manager is not None:
+            return settings_manager.cfg
+        return cfg
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
@@ -74,12 +83,35 @@ def build_app(
         knows whether the stack is usable yet.
         """
         children = status_provider() if status_provider is not None else []
+        active = current_cfg()
         return {
             "ready": all(c["ready"] for c in children),
             "children": children,
-            # Lets the frontend hint "say the wake phrase" when enabled.
-            "wake_word": cfg.wake_word,
+            "wake_word": active.wake_word,
         }
+
+    @app.get("/api/config")
+    async def get_config() -> dict[str, Any]:
+        return current_cfg().to_public_dict()
+
+    @app.put("/api/settings")
+    async def put_settings(request: Request) -> JSONResponse:
+        if settings_manager is None:
+            raise HTTPException(status_code=501, detail="settings not available")
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        try:
+            await settings_manager.apply(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("settings apply failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse({"restarting": True})
 
     @app.post("/api/connection-details")
     async def connection_details(request: Request) -> JSONResponse:
@@ -95,7 +127,7 @@ def build_app(
             agent_name = None
 
         try:
-            data = _mint_token(cfg, agent_name)
+            data = _mint_token(current_cfg(), agent_name)
         except Exception as exc:
             logger.exception("token minting failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -107,14 +139,24 @@ def build_app(
         return {"status": "ok"}
 
     if cfg.frontend_dir:
+        settings_html = f"{cfg.frontend_dir}/settings.html"
+
+        @app.get("/settings")
+        async def settings_page() -> FileResponse:
+            return FileResponse(settings_html)
+
         # SPA-style: serve static export, falling back to index.html for unknown paths.
         static = StaticFiles(directory=cfg.frontend_dir, html=True)
 
         @app.get("/{path:path}")
         async def spa(path: str, request: Request) -> Any:
-            try:
-                return await static.get_response(path or "index.html", request.scope)
-            except Exception:
-                return FileResponse(f"{cfg.frontend_dir}/index.html")
+            for candidate in (path or "index.html", f"{path}.html" if path else None):
+                if not candidate:
+                    continue
+                try:
+                    return await static.get_response(candidate, request.scope)
+                except Exception:
+                    continue
+            return FileResponse(f"{cfg.frontend_dir}/index.html")
 
     return app

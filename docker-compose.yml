@@ -16,8 +16,15 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       STT_PROVIDER: ${STT_PROVIDER:-nemotron}
+      TTS_PROVIDER: ${TTS_PROVIDER:-kokoro}
+      MINIMAX_TTS_MODEL: ${MINIMAX_TTS_MODEL:-speech-2.8-turbo}
+      MINIMAX_TTS_VOICE: ${MINIMAX_TTS_VOICE:-English_expressive_narrator}
       WAKE_WORD: ${WAKE_WORD:-}
       WAKE_WORD_THRESHOLD: ${WAKE_WORD_THRESHOLD:-0.5}
+      LLM_PROVIDER: ${LLM_PROVIDER:-minimax}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-https://api.minimax.io/v1}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M3}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       LLAMA_HF_REPO: ${LLAMA_HF_REPO:-unsloth/gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL}
       LLAMA_OFFLINE: ${LLAMA_OFFLINE:-}
       LLAMA_MODEL_PATH: ${LLAMA_MODEL_PATH:-}

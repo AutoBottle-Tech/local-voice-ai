@@ -57,6 +57,16 @@ class TestManageDefaults:
         assert cfg.manage_llama is False
         assert cfg.manage_livekit and cfg.manage_stt and cfg.manage_tts
 
+    def test_minimax_provider_disables_llama_management(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LLM_PROVIDER", "minimax")
+        monkeypatch.setenv("MINIMAX_API_KEY", "sk-test")
+        cfg = Config.from_env()
+        assert cfg.llm_provider == "minimax"
+        assert cfg.minimax_model == "MiniMax-M3"
+        assert cfg.manage_llama is False
+
     def test_external_stt_disables_management(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("STT_BASE_URL", "https://api.example.com/v1")
         cfg = Config.from_env()
@@ -165,8 +175,38 @@ class TestAgentEnv:
         env = cfg.agent_env()
         for required in (
             "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-            "LLAMA_BASE_URL", "LLAMA_MODEL", "LLAMA_API_KEY",
+            "LLM_PROVIDER", "LLAMA_BASE_URL", "LLAMA_MODEL", "LLAMA_API_KEY",
+            "MINIMAX_BASE_URL", "MINIMAX_MODEL", "MINIMAX_API_KEY",
             "STT_BASE_URL", "STT_MODEL", "STT_API_KEY", "STT_PROVIDER",
-            "TTS_BASE_URL", "TTS_VOICE", "TTS_API_KEY",
+            "TTS_PROVIDER", "TTS_BASE_URL", "TTS_VOICE", "TTS_API_KEY",
+            "MINIMAX_TTS_MODEL", "MINIMAX_TTS_VOICE",
         ):
             assert required in env, f"agent_env missing {required}"
+
+
+class TestTtsProviderDefaults:
+    def test_kokoro_default(self) -> None:
+        cfg = Config.from_env()
+        assert cfg.tts_provider == "kokoro"
+        assert cfg.manage_tts is True
+
+    def test_minimax_disables_local_tts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TTS_PROVIDER", "minimax")
+        cfg = Config.from_env()
+        assert cfg.tts_provider == "minimax"
+        assert cfg.manage_tts is False
+
+    def test_to_public_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_PROVIDER", "minimax")
+        monkeypatch.setenv("MINIMAX_API_KEY", "sk-test")
+        cfg = Config.from_env()
+        public = cfg.to_public_dict()
+        assert public["llm_provider"] == "minimax"
+        assert public["minimax_api_key_set"] is True
+        assert "options" in public
+
+    def test_apply_settings_switches_stt_model(self) -> None:
+        cfg = Config.from_env()
+        updated = cfg.apply_settings({"stt_provider": "whisper"})
+        assert updated.stt_provider == "whisper"
+        assert updated.stt_model == "Systran/faster-whisper-small"

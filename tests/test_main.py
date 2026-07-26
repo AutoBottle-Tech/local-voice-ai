@@ -23,15 +23,13 @@ import pytest
 
 import local_voice_ai.__main__ as main_mod
 from local_voice_ai.__main__ import (
-    _build_specs,
     _hf_hub_dir,
-    _llama_cache_dir,
-    _llama_repo_cached,
     _serve,
     _startup_line,
     make_status_provider,
 )
 from local_voice_ai.config import Config
+from local_voice_ai.specs import _llama_cache_dir, _llama_repo_cached, build_specs
 from local_voice_ai.supervisor import ChildSpec, Supervisor
 
 # Must match Config.llama_hf_repo (checked below) — the :tag selects the quant.
@@ -68,7 +66,7 @@ def _seed_hub(cache_root: Path, repo: str = BARE_REPO, gguf: str | None = None) 
 
 def _llama_spec() -> ChildSpec:
     cfg = Config.from_env()
-    return next(s for s in _build_specs(cfg) if s.name == "llama")
+    return next(s for s in build_specs(cfg) if s.name == "llama")
 
 
 def test_repo_constant_matches_config_default() -> None:
@@ -252,7 +250,7 @@ class TestServeFirstBoot:
             ready_url=f"http://127.0.0.1:{child_port}/",
             ready_timeout=30.0,
         )
-        monkeypatch.setattr(main_mod, "_build_specs", lambda cfg: [spec])
+        monkeypatch.setattr(main_mod, "build_specs", lambda cfg: [spec])
         monkeypatch.setenv("WEB_PORT", str(web_port))
         cfg = Config.from_env()
 
@@ -299,7 +297,7 @@ class TestStatusDetails:
     def _provider(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("HF_HOME", str(tmp_path))
         cfg = Config.from_env()
-        sup = Supervisor(_build_specs(cfg))  # nothing spawned: all not-ready
+        sup = Supervisor(build_specs(cfg))  # nothing spawned: all not-ready
         return make_status_provider(sup, cfg), cfg
 
     def test_no_detail_before_download_starts(
@@ -336,12 +334,12 @@ class TestWhisperSpec:
     ) -> None:
         monkeypatch.setenv("STT_PROVIDER", "whisper")
         cfg = Config.from_env()
-        spec = next(s for s in _build_specs(cfg) if s.name == "whisper")
+        spec = next(s for s in build_specs(cfg) if s.name == "whisper")
         assert "local_voice_ai.services.whisper.server" in spec.argv
         assert spec.env["WHISPER_MODEL"] == "Systran/faster-whisper-small"
         assert spec.ready_url == "http://127.0.0.1:8000/health"
 
     def test_nemotron_is_default(self) -> None:
         cfg = Config.from_env()
-        names = [s.name for s in _build_specs(cfg)]
+        names = [s.name for s in build_specs(cfg)]
         assert "nemotron" in names and "whisper" not in names

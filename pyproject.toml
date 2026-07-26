@@ -44,6 +44,9 @@ ml = [
 whisper = [
     "faster-whisper>=1.0",
 ]
+minimax = [
+    "livekit-plugins-minimax-ai>=1.5.18",
+]
 dev = [
     "pytest",
     "pytest-asyncio",
