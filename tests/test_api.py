@@ -150,10 +150,21 @@ class TestConnectionDetails:
         payload = _decode_jwt_payload(r.json()["participantToken"])
         assert "roomConfig" in payload
 
-    def test_missing_agent_name_does_not_attach_room_config(self, client: TestClient) -> None:
+    def test_missing_agent_name_does_not_attach_room_config(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("AGENT_PROFILE", raising=False)
         r = client.post("/api/connection-details", json={})
         payload = _decode_jwt_payload(r.json()["participantToken"])
         assert "roomConfig" not in payload
+
+    def test_habits_profile_defaults_agent_dispatch(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_PROFILE", "habits")
+        r = client.post("/api/connection-details", json={})
+        payload = _decode_jwt_payload(r.json()["participantToken"])
+        assert payload.get("roomConfig", {}).get("agents") == [{"agentName": "habits"}]
 
     def test_malformed_body_still_returns_a_token(self, client: TestClient) -> None:
         # The Next.js route swallowed JSON errors silently; ours should too.

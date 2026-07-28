@@ -13,9 +13,28 @@ import { ViewController } from '@/components/app/view-controller';
 import { Toaster } from '@/components/livekit/toaster';
 import { useAgentErrors } from '@/hooks/useAgentErrors';
 import { useDebugMode } from '@/hooks/useDebug';
-import { getSandboxTokenSource } from '@/lib/utils';
 
 const IN_DEVELOPMENT = process.env.NODE_ENV !== 'production';
+
+function resolveAgentName(configAgent?: string): string | undefined {
+  if (typeof window === 'undefined') return configAgent;
+  const fromUrl = new URLSearchParams(window.location.search).get('agent');
+  if (fromUrl === 'habits') return 'habits';
+  return configAgent;
+}
+
+function buildTokenSource(agentName?: string) {
+  return TokenSource.custom(async () => {
+    const roomConfig = agentName ? { agents: [{ agent_name: agentName }] } : undefined;
+    const res = await fetch('/api/connection-details', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room_config: roomConfig }),
+    });
+    if (!res.ok) throw new Error('Error fetching connection details!');
+    return res.json();
+  });
+}
 
 function AppSetup() {
   useDebugMode({ enabled: IN_DEVELOPMENT });
@@ -29,16 +48,11 @@ interface AppProps {
 }
 
 export function App({ appConfig }: AppProps) {
-  const tokenSource = useMemo(() => {
-    return typeof process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT === 'string'
-      ? getSandboxTokenSource(appConfig)
-      : TokenSource.endpoint('/api/connection-details');
-  }, [appConfig]);
+  const agentName = useMemo(() => resolveAgentName(appConfig.agentName), [appConfig.agentName]);
 
-  const session = useSession(
-    tokenSource,
-    appConfig.agentName ? { agentName: appConfig.agentName } : undefined
-  );
+  const tokenSource = useMemo(() => buildTokenSource(agentName), [agentName]);
+
+  const session = useSession(tokenSource, agentName ? { agentName } : undefined);
 
   return (
     <SessionProvider session={session}>

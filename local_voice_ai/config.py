@@ -302,6 +302,11 @@ class Config:
             "TTS_API_KEY": self.tts_api_key,
             "MINIMAX_TTS_MODEL": self.minimax_tts_model,
             "MINIMAX_TTS_VOICE": self.minimax_tts_voice,
+            "AGENT_PROFILE": os.getenv("AGENT_PROFILE", "default"),
+            "HABITS_API_URL": os.getenv(
+                "HABITS_API_URL", "http://host.docker.internal:8787"
+            ),
+            "HABITS_INTERNAL_BEARER": os.getenv("HABITS_INTERNAL_BEARER", ""),
         }
         return env
 

@@ -10,6 +10,7 @@ Two responsibilities:
 from __future__ import annotations
 
 import logging
+import os
 import random
 from collections.abc import Callable
 from datetime import timedelta
@@ -125,6 +126,10 @@ def build_app(
             agent_name = body.get("room_config", {}).get("agents", [{}])[0].get("agent_name")
         except (AttributeError, IndexError, TypeError):
             agent_name = None
+
+        # Stale static frontends may omit room_config; match the habits worker registration.
+        if not agent_name and os.getenv("AGENT_PROFILE", "").lower() == "habits":
+            agent_name = "habits"
 
         try:
             data = _mint_token(current_cfg(), agent_name)

@@ -8,7 +8,6 @@ correct for both single-image deployment and bare-metal local runs.
 
 import logging
 import os
-import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -26,76 +25,20 @@ from livekit.agents import (
     function_tool,
     llm,
 )
-from livekit.agents.types import FlushSentinel
 from livekit.agents.voice.agent import ModelSettings
 from livekit.plugins import openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+from .habits_agent import HabitsAssistant, build_habits_context
+from .llm_filter import stream_llm_with_thinking_filter
 
 load_dotenv()
 load_dotenv(".env.local")
 
-_THINKING_TAG = "redacted_thinking"
-_THINKING_OPEN = f"<{_THINKING_TAG}>"
-_THINKING_CLOSE = f"</{_THINKING_TAG}>"
-_THINKING_RE = re.compile(
-    rf"{re.escape(_THINKING_OPEN)}.*?{re.escape(_THINKING_CLOSE)}\s*",
-    re.DOTALL,
-)
+logger = logging.getLogger("agent")
 
-
-def _strip_minimax_thinking(text: str) -> str:
-    return _THINKING_RE.sub("", text)
-
-
-class _MiniMaxThinkingFilter:
-    """Remove MiniMax thinking markup from streamed LLM text (tags may span chunks)."""
-
-    def __init__(self) -> None:
-        self._pending = ""
-        self._in_thinking = False
-
-    def push(self, text: str) -> str:
-        self._pending += text
-        out: list[str] = []
-        while self._pending:
-            if self._in_thinking:
-                close = self._pending.find(_THINKING_CLOSE)
-                if close == -1:
-                    break
-                self._pending = self._pending[close + len(_THINKING_CLOSE) :].lstrip()
-                self._in_thinking = False
-                continue
-
-            open_idx = self._pending.find(_THINKING_OPEN)
-            if open_idx == -1:
-                hold = 0
-                for i in range(1, len(_THINKING_OPEN) + 1):
-                    if self._pending.endswith(_THINKING_OPEN[:i]):
-                        hold = i
-                if hold:
-                    if len(self._pending) > hold:
-                        out.append(self._pending[:-hold])
-                        self._pending = self._pending[-hold:]
-                    break
-                out.append(self._pending)
-                self._pending = ""
-                break
-
-            out.append(self._pending[:open_idx])
-            self._pending = self._pending[open_idx + len(_THINKING_OPEN) :]
-            self._in_thinking = True
-        return "".join(out)
-
-    def flush(self) -> str:
-        if self._in_thinking:
-            self._pending = ""
-            self._in_thinking = False
-            return ""
-        result = self._pending
-        self._pending = ""
-        return result
+_AGENT_PROFILE = os.getenv("AGENT_PROFILE", "default").lower()
+_RTC_SESSION_KWARGS = {"agent_name": "habits"} if _AGENT_PROFILE == "habits" else {}
 
 
 def _is_loopback(url: str) -> bool:
@@ -263,30 +206,10 @@ class Assistant(Agent):
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ):
-        stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
-        strip_thinking = os.getenv("LLM_PROVIDER", "llama").lower() == "minimax"
-        thinking_filter = _MiniMaxThinkingFilter() if strip_thinking else None
-
-        async for chunk in stream:
-            if not strip_thinking or thinking_filter is None:
-                yield chunk
-                continue
-
-            if isinstance(chunk, str):
-                cleaned = thinking_filter.push(chunk)
-                if cleaned:
-                    yield cleaned
-            elif isinstance(chunk, llm.ChatChunk):
-                if chunk.delta and chunk.delta.content:
-                    chunk.delta.content = thinking_filter.push(chunk.delta.content)
-                yield chunk
-            elif isinstance(chunk, FlushSentinel):
-                remainder = thinking_filter.flush()
-                if remainder:
-                    yield remainder
-                yield chunk
-            else:
-                yield chunk
+        async for chunk in stream_llm_with_thinking_filter(
+            self, chat_ctx, tools, model_settings
+        ):
+            yield chunk
 
 
 server = AgentServer()
@@ -299,7 +222,22 @@ def prewarm(proc: JobProcess) -> None:
 server.setup_fnc = prewarm
 
 
-@server.rtc_session()
+async def _resolve_agent() -> Agent:
+    if _AGENT_PROFILE == "habits":
+        context_block = await build_habits_context()
+        logger.info("habits context loaded (%d chars)", len(context_block))
+        return HabitsAssistant(context_block)
+    return Assistant()
+
+
+def _habits_greeting_instructions() -> str:
+    return (
+        "You are the Habits coach. Greet the user briefly, mention you can log meals "
+        "or schedule events, and ask what they need."
+    )
+
+
+@server.rtc_session(**_RTC_SESSION_KWARGS)
 async def my_agent(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
@@ -337,8 +275,11 @@ async def my_agent(ctx: JobContext) -> None:
         preemptive_generation=llm_provider != "minimax",
     )
 
+    agent = await _resolve_agent()
+    is_habits = _AGENT_PROFILE == "habits"
+
     # session.start(room=...) connects to LiveKit internally; do not call ctx.connect() again.
-    await session.start(agent=Assistant(), room=ctx.room)
+    await session.start(agent=agent, room=ctx.room)
 
     if wake_word:
         # Join deaf, wait for the wake phrase, then wake up and greet.
@@ -352,22 +293,29 @@ async def my_agent(ctx: JobContext) -> None:
             # Fail open: a broken detector shouldn't brick the assistant.
             logger.exception("wake word detection failed; enabling audio input")
         session.input.set_audio_enabled(True)
-        session.generate_reply(
-            user_input="Hello",
-            instructions=(
+        greet = (
+            _habits_greeting_instructions()
+            if is_habits
+            else (
                 "You just woke up because the user said the wake phrase. "
                 "Greet them very briefly and ask how you can help."
-            ),
+            )
         )
+        session.generate_reply(user_input="Hello", instructions=greet)
     else:
         # MiniMax requires non-empty user content; a placeholder turn is enough.
         session.input.set_audio_enabled(False)
-        handle = session.generate_reply(
-            user_input="Hello",
-            instructions=(
+        greet = (
+            _habits_greeting_instructions()
+            if is_habits
+            else (
                 "Greet the user warmly in one short sentence and invite them "
                 "to ask you anything."
-            ),
+            )
+        )
+        handle = session.generate_reply(
+            user_input="Hello",
+            instructions=greet,
             allow_interruptions=False,
         )
         await handle.wait_for_playout()
